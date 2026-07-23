@@ -44,8 +44,8 @@ def load_processed(split: str) -> dict:
         return {json.loads(l)["encounter_id"]: json.loads(l) for l in f}
 
 
-def load_generated(strategy: str, split: str) -> dict:
-    path = GENERATED_DIR / f"{strategy}_{split}.jsonl"
+def load_generated(strategy: str, split: str, provider: str = "gemini") -> dict:
+    path = GENERATED_DIR / f"{provider}_{strategy}_{split}.jsonl"
     with open(path, encoding="utf-8") as f:
         return {json.loads(l)["encounter_id"]: json.loads(l) for l in f}
 

@@ -1,4 +1,6 @@
 pandas>=2.0
 pytest>=8.0
 google-genai>=1.0
+groq>=0.13
 python-dotenv>=1.0
+openpyxl>=3.1
