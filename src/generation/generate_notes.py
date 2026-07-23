@@ -40,6 +40,11 @@ OUTPUT_DIR = ROOT / "data" / "generated"
 FEW_SHOT_EXAMPLE_ID = "D2N001"
 
 PROVIDER_MODELS = {
+    # llama-3.1-8b-instant has a much larger daily budget (500K TPD vs 100K) but only a
+    # 6K-tokens-per-request ceiling, which our longer transcripts (up to 136 turns) blow
+    # past outright (413, not a retryable 429). llama-3.3-70b-versatile's per-request
+    # ceiling is 12K -- comfortably covers every transcript in the corpus -- so it's the
+    # safer choice even though its daily budget (100K TPD) means ~35-40 calls/day.
     "groq": "llama-3.3-70b-versatile",
     "gemini": "gemini-flash-lite-latest",
 }
@@ -117,6 +122,11 @@ class DailyQuotaExhausted(Exception):
     """Free-tier per-day quota hit -- not worth backing off for, unlike per-minute limits."""
 
 
+class RequestTooLarge(Exception):
+    """Single request exceeds the model's per-request token ceiling -- not retryable,
+    but shouldn't crash the whole run; skip this one encounter and move on."""
+
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -169,8 +179,13 @@ def generate_with_retry(provider: str, client, model: str, prompt: str, max_retr
         except Exception as e:
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
             message = str(e)
-            if status == 429 and ("PerDay" in message or "per_day" in message.lower()):
+            # Normalize away spaces/underscores/case so this matches both providers'
+            # phrasing: Gemini's "...PerDayPerProject..." and Groq's "tokens per day (TPD)".
+            normalized = message.lower().replace(" ", "").replace("_", "")
+            if status == 429 and "perday" in normalized:
                 raise DailyQuotaExhausted(message) from e
+            if status == 413:
+                raise RequestTooLarge(message) from e
             if status in RETRYABLE_STATUS and attempt < max_retries - 1:
                 print(f"  {status}, backing off {delay:.0f}s...", file=sys.stderr)
                 time.sleep(delay)
@@ -192,26 +207,59 @@ def main():
                          help="seconds to sleep between calls (rate limiting)")
     args = parser.parse_args()
 
-    model = PROVIDER_MODELS[args.provider]
-    client = _make_client(args.provider)
-    encounters = load_split(args.split)
-    if args.limit:
-        encounters = encounters[: args.limit]
-
-    few_shot_prefix = build_few_shot_example() if "few_shot" in args.strategies else None
+    # Guard against two invocations targeting the same (provider, split) writing to the
+    # same output files concurrently -- observed once as silent duplicate generations
+    # with no clear trigger; this makes a second overlapping run fail fast instead.
+    lock_path = OUTPUT_DIR / f".lock_{args.provider}_{args.split}"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        print(f"Another run is already writing to {args.provider}/{args.split} outputs "
+              f"(lock file exists: {lock_path}). If no such run is actually active, "
+              f"delete the lock file and retry.", file=sys.stderr)
+        sys.exit(1)
+    os.close(lock_fd)
+
+    try:
+        model = PROVIDER_MODELS[args.provider]
+        client = _make_client(args.provider)
+        encounters = load_split(args.split)
+        if args.limit:
+            encounters = encounters[: args.limit]
+        _run(args, model, client, encounters)
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _run(args, model, client, encounters):
+    few_shot_prefix = build_few_shot_example() if "few_shot" in args.strategies else None
 
     for strategy in args.strategies:
         out_path = OUTPUT_DIR / f"{args.provider}_{strategy}_{args.split}.jsonl"
 
         # Resume support: skip encounters already completed in a prior (possibly
-        # crashed) run rather than re-spending calls on them.
+        # crashed) run rather than re-spending calls on them. Only trust records that
+        # match the model currently configured -- a prior run under a different model
+        # (e.g. a mid-project model switch) must not be silently treated as "done" and
+        # smuggle a mixed-model confound back into the corpus.
         done_ids = set()
+        stale = 0
         if out_path.exists():
             with open(out_path, encoding="utf-8") as f:
                 for line in f:
-                    if line.strip():
-                        done_ids.add(json.loads(line)["encounter_id"])
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("model") == model:
+                        done_ids.add(rec["encounter_id"])
+                    else:
+                        stale += 1
+        if stale:
+            print(f"  WARNING: {stale} existing rows in {out_path} were generated with a "
+                  f"different model and will NOT count as done -- resolve this file manually "
+                  f"before continuing (delete stale rows or the whole file).", file=sys.stderr)
+            continue
 
         targets = [e for e in encounters if e["encounter_id"] not in done_ids]
         if strategy == "few_shot":
@@ -231,6 +279,10 @@ def main():
                           f"stopping here, {n_done} new notes saved this run.", file=sys.stderr)
                     quota_hit = True
                     break
+                except RequestTooLarge:
+                    print(f"  {enc['encounter_id']}: transcript too large for {model}'s "
+                          f"per-request limit -- skipping this encounter.", file=sys.stderr)
+                    continue
                 record = {
                     "encounter_id": enc["encounter_id"],
                     "challenge_split": enc["challenge_split"],
